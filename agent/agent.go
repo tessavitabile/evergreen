@@ -45,6 +45,9 @@ const (
 	CompletedSuccess
 	// CompletedFailure indicates task successfully ran to completion but failed.
 	CompletedFailure
+	// Completed indicates that the task completed without incidient. This signal is
+	// used internally to shut down the signal handler.
+	Completed
 )
 
 const (
@@ -108,15 +111,17 @@ type TaskCommunicator interface {
 // SignalHandler is an implementation of TerminateHandler which runs the post-run
 // script when a task finishes, and reports its results back to the API server.
 type SignalHandler struct {
-	// KillChan is a channel which once closed, causes any in-progress commands to abort.
-	KillChan chan bool
+	// === NEW ===
+	heartbeatChan, idleTimeoutChan, execTimeoutChan, communicatorChan chan Signal
+
+	stopBackgroundChan chan struct{}
+
+	// === OLD ===
+
 	// Post is a set of commands to run after an agent completes a task execution.
 	Post *model.YAMLCommandSet
 	// Timeout is a set of commands to run if/when an IdleTimeout signal is received.
 	Timeout *model.YAMLCommandSet
-	// Channel on which to send/receive notifications from background tasks
-	// (timeouts, heartbeat failures, abort signals, etc).
-	signalChan chan Signal
 }
 
 // Agent controls the various components and background processes needed
@@ -130,9 +135,8 @@ type Agent struct {
 	// ExecTracker keeps track of the agent's current stage of execution.
 	ExecTracker
 
-	// Channel on which to send/receive notifications from background tasks
-	// (timeouts, heartbeat failures, abort signals, etc).
-	signalChan chan Signal
+	// KillChan is a channel which once closed, causes any in-progress commands to abort.
+	KillChan chan bool
 
 	// signalHandler is used to process signals received by the agent during execution.
 	signalHandler *SignalHandler
@@ -164,7 +168,7 @@ type Agent struct {
 	// Holds the current command being executed by the agent.
 	currentCommand model.PluginCommandConf
 
-	// taskConfig holds the project, distro and task objects for the agent's
+	dont // taskConfig holds the project, distro and task objects for the agent's
 	// assigned task.
 	taskConfig *model.TaskConfig
 
@@ -175,19 +179,8 @@ type Agent struct {
 // finishAndAwaitCleanup sends the returned TaskEndResponse and error - as
 // gotten from the FinalTaskFunc function - for processing by the main agent loop.
 func (agt *Agent) finishAndAwaitCleanup(status Signal, completed chan FinalTaskFunc) (*apimodels.TaskEndResponse, error) {
-	agt.signalChan <- status
-	if agt.heartbeater.stop != nil {
-		agt.heartbeater.stop <- true
-	}
-	if agt.statsCollector.stop != nil {
-		agt.statsCollector.stop <- true
-	}
-	if agt.idleTimeoutWatcher.stop != nil {
-		agt.idleTimeoutWatcher.stop <- true
-	}
-	if agt.maxExecTimeoutWatcher != nil && agt.maxExecTimeoutWatcher.stop != nil {
-		agt.maxExecTimeoutWatcher.stop <- true
-	}
+	// TODO make this a method VVV
+	close(agt.SignalHandler.stopBackgroundChan)
 	agt.APILogger.FlushAndWait()
 	taskFinishFunc := <-completed // waiting for HandleSignals() to finish
 	ret, err := taskFinishFunc()  // calling taskCom.End(), or similar
@@ -208,16 +201,43 @@ func (agt *Agent) getTaskEndDetail() *apimodels.TaskEndDetail {
 	}
 }
 
+// makeChannels allocates async channels for each background process.
+func (sh *SignalHandler) makeChannels() {
+	sh.heartbeatChan = make(chan Signal, 1)
+	sh.idleTimeoutChan = make(chan Signal, 1)
+	sh.execTimeoutChan = make(chan Signal, 1)
+	sh.communicatorChan = make(chan Signal, 1)
+	sh.stopBackgroundChan = make(chan struct{}, 1)
+}
+
+// awaitSignal demultiplexes inputs from the various background processes
+func (sh *SignalHandler) awaitSignal() Signal {
+	var sig Signal
+	select {
+	case sig = <-heartbeatChan:
+	case sig = <-idleTimeoutChan:
+	case sig = <-execTimeoutChan:
+	case sig = <-communicatorChan:
+	case sig = <-stopBackgroundChan:
+		return Completed
+	}
+	return sig
+}
+
 // HandleSignals listens on its signal channel and properly handles any signal received.
 func (sh *SignalHandler) HandleSignals(agt *Agent, completed chan FinalTaskFunc) {
-	receivedSignal := <-sh.signalChan
+	receivedSignal := sh.awaitSignal()
 
 	// Stop any running commands.
-	close(sh.KillChan)
+	close(agt.KillChan)
 
 	detail := agt.getTaskEndDetail()
 
 	switch receivedSignal {
+	case Completed:
+		agt.logger.LogLocal(slogger.INFO, "Task executed correctly - cleaning up")
+		// everything went according to plan, so we just exit the signal handler routine
+		return
 	case IncorrectSecret:
 		agt.logger.LogLocal(slogger.ERROR, "Secret doesn't match - exiting.")
 		os.Exit(1)
@@ -358,8 +378,8 @@ func New(apiServerURL, taskId, taskSecret, logFile, cert string) (*Agent, error)
 		statsCollector:     statsCollector,
 		idleTimeoutWatcher: idleTimeoutWatcher,
 		APILogger:          apiLogger,
-		signalChan:         sigChan,
 		Registry:           plugin.NewSimpleRegistry(),
+		KillChan:           make(chan bool),
 	}
 
 	return agt, nil
@@ -409,14 +429,8 @@ func (agt *Agent) RunTask() (*apimodels.TaskEndResponse, error) {
 	agt.taskConfig = taskConfig
 
 	// initialize agent's signal handler to listen for signals
-	signalHandler := &SignalHandler{
-		KillChan:   make(chan bool),
-		signalChan: agt.signalChan,
-		Post:       agt.taskConfig.Project.Post,
-		Timeout:    agt.taskConfig.Project.Timeout,
-	}
-
-	agt.signalHandler = signalHandler
+	ag.signalHandler.Post = agt.taskConfig.Project.Post
+	ag.signalHandler.Timeout = agt.taskConfig.Project.Timeout
 
 	// start the heartbeater, timeout watcher, system stats collector
 	// and signal listener
@@ -457,7 +471,7 @@ func (agt *Agent) RunTaskCommands(completed chan FinalTaskFunc) (*apimodels.Task
 
 	agt.logger.LogExecution(slogger.INFO, "Running task commands.")
 	start := time.Now()
-	err := agt.RunCommands(task.Commands, true, agt.signalHandler.KillChan)
+	err := agt.RunCommands(task.Commands, true, agt.KillChan)
 	agt.logger.LogExecution(slogger.INFO, "Finished running task commands in %v.", time.Since(start).String())
 
 	if err != nil {
@@ -582,11 +596,11 @@ func (agt *Agent) StartBackgroundActions(signalHandler TerminateHandler) chan Fi
 	completed := make(chan FinalTaskFunc)
 	agt.heartbeater.StartHeartbeating()
 	agt.statsCollector.LogStats(agt.taskConfig.Expansions)
-	agt.idleTimeoutWatcher.NotifyTimeouts(agt.signalChan)
+	agt.idleTimeoutWatcher.NotifyTimeouts(agt.signalHandler.idleTimeoutChan)
 
 	// Default action is not to include a master timeout
 	if agt.maxExecTimeoutWatcher != nil {
-		agt.maxExecTimeoutWatcher.NotifyTimeouts(agt.signalChan)
+		agt.maxExecTimeoutWatcher.NotifyTimeouts(agt.signalHandler.execTimeoutChan)
 	}
 	go signalHandler.HandleSignals(agt, completed)
 
