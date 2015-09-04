@@ -15,7 +15,7 @@ type HeartbeatTicker struct {
 	SignalChan chan Signal
 
 	// A channel which, when closed, tells the heartbeat ticker should stop.
-	stop chan bool
+	stop chan struct{}
 
 	// The current count of how many heartbeats have failed consecutively.
 	numFailed int
@@ -27,11 +27,7 @@ type HeartbeatTicker struct {
 }
 
 func (hbt *HeartbeatTicker) StartHeartbeating() {
-	if hbt.stop != nil {
-		panic("Heartbeat goroutine already running!")
-	}
 	hbt.numFailed = 0
-	hbt.stop = make(chan bool)
 
 	go func() {
 		ticker := time.NewTicker(hbt.Interval)
@@ -67,8 +63,4 @@ func (hbt *HeartbeatTicker) StartHeartbeating() {
 			}
 		}
 	}()
-}
-
-func (hbt *HeartbeatTicker) Stop() {
-	hbt.stop <- true
 }

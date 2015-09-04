@@ -168,7 +168,7 @@ type Agent struct {
 	// Holds the current command being executed by the agent.
 	currentCommand model.PluginCommandConf
 
-	dont // taskConfig holds the project, distro and task objects for the agent's
+	// taskConfig holds the project, distro and task objects for the agent's
 	// assigned task.
 	taskConfig *model.TaskConfig
 
@@ -180,7 +180,7 @@ type Agent struct {
 // gotten from the FinalTaskFunc function - for processing by the main agent loop.
 func (agt *Agent) finishAndAwaitCleanup(status Signal, completed chan FinalTaskFunc) (*apimodels.TaskEndResponse, error) {
 	// TODO make this a method VVV
-	close(agt.SignalHandler.stopBackgroundChan)
+	close(agt.signalHandler.stopBackgroundChan)
 	agt.APILogger.FlushAndWait()
 	taskFinishFunc := <-completed // waiting for HandleSignals() to finish
 	ret, err := taskFinishFunc()  // calling taskCom.End(), or similar
@@ -214,11 +214,11 @@ func (sh *SignalHandler) makeChannels() {
 func (sh *SignalHandler) awaitSignal() Signal {
 	var sig Signal
 	select {
-	case sig = <-heartbeatChan:
-	case sig = <-idleTimeoutChan:
-	case sig = <-execTimeoutChan:
-	case sig = <-communicatorChan:
-	case sig = <-stopBackgroundChan:
+	case sig = <-sh.heartbeatChan:
+	case sig = <-sh.idleTimeoutChan:
+	case sig = <-sh.execTimeoutChan:
+	case sig = <-sh.communicatorChan:
+	case <-sh.stopBackgroundChan:
 		return Completed
 	}
 	return sig
@@ -336,9 +336,11 @@ func (agt *Agent) GetTaskConfig() (*model.TaskConfig, error) {
 // New creates a new agent to run a given task.
 func New(apiServerURL, taskId, taskSecret, logFile, cert string) (*Agent, error) {
 	sigChan := make(chan Signal, 1)
+	sh := &SignalHandler{}
+	sh.makeChannels()
 
 	// set up communicator with API server
-	httpCommunicator, err := NewHTTPCommunicator(apiServerURL, taskId, taskSecret, cert, sigChan)
+	httpCommunicator, err := NewHTTPCommunicator(apiServerURL, taskId, taskSecret, cert, sh.communicatorChan)
 	if err != nil {
 		return nil, err
 	}
@@ -357,10 +359,11 @@ func New(apiServerURL, taskId, taskSecret, logFile, cert string) (*Agent, error)
 	// set up the heartbeat ticker
 	hbTicker := &HeartbeatTicker{
 		MaxFailedHeartbeats: 10,
-		SignalChan:          sigChan,
+		SignalChan:          sh.heartbeatChan,
 		TaskCommunicator:    httpCommunicator,
 		Logger:              httpCommunicator.Logger,
 		Interval:            DefaultHeartbeatInterval,
+		stop:                sh.stopBackgroundChan,
 	}
 
 	// set up the system stats collector
@@ -372,6 +375,7 @@ func New(apiServerURL, taskId, taskSecret, logFile, cert string) (*Agent, error)
 	)
 
 	agt := &Agent{
+		signalHandler:      sh,
 		logger:             streamLogger,
 		TaskCommunicator:   httpCommunicator,
 		heartbeater:        hbTicker,
@@ -429,12 +433,12 @@ func (agt *Agent) RunTask() (*apimodels.TaskEndResponse, error) {
 	agt.taskConfig = taskConfig
 
 	// initialize agent's signal handler to listen for signals
-	ag.signalHandler.Post = agt.taskConfig.Project.Post
-	ag.signalHandler.Timeout = agt.taskConfig.Project.Timeout
+	agt.signalHandler.Post = agt.taskConfig.Project.Post
+	agt.signalHandler.Timeout = agt.taskConfig.Project.Timeout
 
 	// start the heartbeater, timeout watcher, system stats collector
 	// and signal listener
-	completed := agt.StartBackgroundActions(signalHandler)
+	completed := agt.StartBackgroundActions(agt.signalHandler)
 
 	// register plugins needed for execution
 	if err = registerPlugins(agt.Registry, plugin.CommandPlugins, agt.logger); err != nil {

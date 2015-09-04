@@ -193,7 +193,7 @@ func TestBasicEndpoints(t *testing.T) {
 				testAgent.idleTimeoutWatcher.CheckIn()
 				// sleep long enough for the timeout watcher to time out
 				time.Sleep(3 * time.Second)
-				timeoutSignal, ok := <-testAgent.signalChan
+				timeoutSignal, ok := <-testAgent.signalHandler.idleTimeoutChan
 				So(ok, ShouldBeTrue)
 				So(timeoutSignal, ShouldEqual, IdleTimeout)
 			})
@@ -214,12 +214,11 @@ func TestHeartbeatSignals(t *testing.T) {
 			testAgent, err := createAgent(testServer, testTask)
 			testutil.HandleTestingErr(err, t, "failed to create agent: %v")
 			testAgent.heartbeater.Interval = 100 * time.Millisecond
-			testAgent.signalHandler = &SignalHandler{}
 			testAgent.StartBackgroundActions(&NoopSignalHandler{})
 
 			Convey("killing the server should result in failure signal", func() {
 				testServer.Listener.Close()
-				signal, ok := <-testAgent.signalChan
+				signal, ok := <-testAgent.signalHandler.heartbeatChan
 				So(ok, ShouldBeTrue)
 				So(signal, ShouldEqual, HeartbeatMaxFailed)
 			})
@@ -240,12 +239,11 @@ func TestSecrets(t *testing.T) {
 			testutil.HandleTestingErr(err, t, "failed to create agent: %v")
 
 			testAgent.heartbeater.Interval = 100 * time.Millisecond
-			testAgent.signalHandler = &SignalHandler{}
 			testAgent.StartBackgroundActions(&NoopSignalHandler{})
 
 			Convey("killing the server should result in failure signal", func() {
 				testServer.Listener.Close()
-				signal, ok := <-testAgent.signalChan
+				signal, ok := <-testAgent.signalHandler.heartbeatChan
 				So(ok, ShouldBeTrue)
 				So(signal, ShouldEqual, HeartbeatMaxFailed)
 			})
@@ -547,7 +545,6 @@ func TestTaskEndEndpoint(t *testing.T) {
 			testAgent, err := createAgent(testServer, testTask)
 			testutil.HandleTestingErr(err, t, "failed to create agent: %v")
 			testAgent.heartbeater.Interval = 10 * time.Second
-			testAgent.signalHandler = &SignalHandler{}
 			testAgent.StartBackgroundActions(&NoopSignalHandler{})
 
 			Convey("calling end() should update task's/host's status properly "+
