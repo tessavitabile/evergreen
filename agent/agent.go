@@ -138,6 +138,10 @@ type Agent struct {
 	// KillChan is a channel which once closed, causes any in-progress commands to abort.
 	KillChan chan bool
 
+	// endChan holds a base set of task details that are populated during erroneous
+	// execution behavior.
+	endChan chan *apimodels.TaskEndDetail
+
 	// signalHandler is used to process signals received by the agent during execution.
 	signalHandler *SignalHandler
 
@@ -178,13 +182,41 @@ type Agent struct {
 
 // finishAndAwaitCleanup sends the returned TaskEndResponse and error - as
 // gotten from the FinalTaskFunc function - for processing by the main agent loop.
+// TODO change status type
 func (agt *Agent) finishAndAwaitCleanup(status Signal, completed chan FinalTaskFunc) (*apimodels.TaskEndResponse, error) {
+
 	// TODO make this a method VVV
 	close(agt.signalHandler.stopBackgroundChan)
-	agt.APILogger.FlushAndWait()
-	taskFinishFunc := <-completed // waiting for HandleSignals() to finish
-	ret, err := taskFinishFunc()  // calling taskCom.End(), or similar
-	agt.APILogger.FlushAndWait()  // any logs from HandleSignals() or End()
+
+	// TODO roll this in with getTaskEndDetail
+	var detail *apimodels.TaskEndDetail
+	select {
+	case detail = <-agt.endChan:
+		// pull from the channel if possible
+	default:
+		detail = agt.getTaskEndDetail()
+	}
+	if status == CompletedSuccess {
+		detail.Status = evergreen.TaskSucceeded
+		agt.logger.LogTask(slogger.INFO, "Task completed - SUCCESS.")
+	} else {
+		agt.logger.LogTask(slogger.INFO, "Task completed - FAILURE.")
+	}
+
+	// run post commands
+	if agt.signalHandler.Post != nil {
+		agt.logger.LogTask(slogger.INFO, "Running post-task commands.")
+		start := time.Now()
+		err := agt.RunCommands(agt.signalHandler.Post.List(), false, nil)
+		if err != nil {
+			agt.logger.LogExecution(slogger.ERROR, "Error running post-task command: %v", err)
+		}
+		agt.logger.LogTask(slogger.INFO, "Finished running post-task commands in %v.", time.Since(start).String())
+	}
+
+	agt.logger.LogExecution(slogger.INFO, "Sending final status as: %v", detail.Status)
+	ret, err := agt.End(detail)
+	agt.APILogger.FlushAndWait() // ensure we send any logs from End()
 	return ret, err
 }
 
@@ -226,18 +258,13 @@ func (sh *SignalHandler) awaitSignal() Signal {
 
 // HandleSignals listens on its signal channel and properly handles any signal received.
 func (sh *SignalHandler) HandleSignals(agt *Agent, completed chan FinalTaskFunc) {
-	receivedSignal := sh.awaitSignal()
-
-	// Stop any running commands.
-	close(agt.KillChan)
-
 	detail := agt.getTaskEndDetail()
-
+	receivedSignal := sh.awaitSignal()
 	switch receivedSignal {
 	case Completed:
 		agt.logger.LogLocal(slogger.INFO, "Task executed correctly - cleaning up")
 		// everything went according to plan, so we just exit the signal handler routine
-		return
+		// TODO: return
 	case IncorrectSecret:
 		agt.logger.LogLocal(slogger.ERROR, "Secret doesn't match - exiting.")
 		os.Exit(1)
@@ -259,28 +286,15 @@ func (sh *SignalHandler) HandleSignals(agt *Agent, completed chan FinalTaskFunc)
 			}
 			agt.logger.LogTask(slogger.INFO, "Finished running task-timeout commands in %v.", time.Since(start).String())
 		}
-	case CompletedSuccess:
-		detail.Status = evergreen.TaskSucceeded
-		agt.logger.LogTask(slogger.INFO, "Task completed - SUCCESS.")
-	case CompletedFailure:
-		agt.logger.LogTask(slogger.INFO, "Task completed - FAILURE.")
+
 	}
 
-	if sh.Post != nil {
-		agt.logger.LogTask(slogger.INFO, "Running post-task commands.")
-		start := time.Now()
-		err := agt.RunCommands(sh.Post.List(), false, nil)
-		if err != nil {
-			agt.logger.LogExecution(slogger.ERROR, "Error running post-task command: %v", err)
-		}
-		agt.logger.LogTask(slogger.INFO, "Finished running post-task commands in %v.", time.Since(start).String())
-	}
-	agt.logger.LogExecution(slogger.INFO, "Sending final status as: %v", detail.Status)
+	// buffer the end details so that we can pick them up once the running command finishes
+	agt.endChan <- detail
 
-	// make the API call to end the task
-	completed <- func() (*apimodels.TaskEndResponse, error) {
-		return agt.End(detail)
-	}
+	// stop any running commands.
+	close(agt.KillChan)
+
 }
 
 // GetCurrentCommand returns the current command being executed
@@ -335,7 +349,6 @@ func (agt *Agent) GetTaskConfig() (*model.TaskConfig, error) {
 
 // New creates a new agent to run a given task.
 func New(apiServerURL, taskId, taskSecret, logFile, cert string) (*Agent, error) {
-	sigChan := make(chan Signal, 1)
 	sh := &SignalHandler{}
 	sh.makeChannels()
 
@@ -384,6 +397,7 @@ func New(apiServerURL, taskId, taskSecret, logFile, cert string) (*Agent, error)
 		APILogger:          apiLogger,
 		Registry:           plugin.NewSimpleRegistry(),
 		KillChan:           make(chan bool),
+		endChan:            make(chan *apimodels.TaskEndDetail, 1),
 	}
 
 	return agt, nil
