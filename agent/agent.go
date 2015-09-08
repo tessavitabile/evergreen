@@ -9,24 +9,17 @@ import (
 	"github.com/evergreen-ci/evergreen/model/distro"
 	"github.com/evergreen-ci/evergreen/plugin"
 	_ "github.com/evergreen-ci/evergreen/plugin/config"
-	"github.com/evergreen-ci/evergreen/util"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
 )
 
+const APIVersion = 2
+
 // Signal describes the various conditions under which the agent
 // will complete execution of a task.
 type Signal int64
-
-// The FinalTaskFunc describes the expected return values for a given task run
-// by the agent. The finishAndAwaitCleanup listens on a channel for this
-// function and runs returns its values once it receives the function to run.
-// This will typically be an HTTP call to the API server (to end the task).
-type FinalTaskFunc func() (*apimodels.TaskEndResponse, error)
-
-const APIVersion = 2
 
 // Recognized agent signals.
 const (
@@ -58,7 +51,7 @@ const (
 	DefaultHeartbeatInterval = 30 * time.Second
 	// DefaultStatsInterval is the interval after which agent sends system stats
 	// to API server
-	DefaultStatsInterval = 60 * time.Second
+	DefaultStatsInterval = time.Minute
 )
 
 var (
@@ -186,8 +179,8 @@ func (agt *Agent) finishAndAwaitCleanup(status string) (*apimodels.TaskEndRespon
 	default:
 		detail = agt.getTaskEndDetail()
 	}
+	detail.Status = status
 	if status == evergreen.TaskSucceeded {
-		detail.Status = evergreen.TaskSucceeded
 		agt.logger.LogTask(slogger.INFO, "Task completed - SUCCESS.")
 	} else {
 		agt.logger.LogTask(slogger.INFO, "Task completed - FAILURE.")
@@ -334,7 +327,6 @@ func (agt *Agent) GetTaskConfig() (*model.TaskConfig, error) {
 
 	agt.logger.LogExecution(slogger.INFO, "Constructing TaskConfig.")
 	return model.NewTaskConfig(distro, project, task, ref)
-
 }
 
 // New creates a new agent to run a given task.
@@ -605,8 +597,4 @@ func (agt *Agent) StartBackgroundActions(signalHandler TerminateHandler) {
 		agt.maxExecTimeoutWatcher.NotifyTimeouts(agt.signalHandler.execTimeoutChan)
 	}
 	go signalHandler.HandleSignals(agt)
-
-	// listen for SIGQUIT and dump a stack trace to system logs if received.
-	// TODO only one of these
-	go util.DumpStackOnSIGQUIT(evergreen.NewInfoLoggingWriter(agt.logger.System))
 }
