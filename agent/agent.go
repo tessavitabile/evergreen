@@ -192,7 +192,8 @@ func (agt *Agent) finishAndAwaitCleanup(status Signal, completed chan FinalTaskF
 	var detail *apimodels.TaskEndDetail
 	select {
 	case detail = <-agt.endChan:
-		// pull from the channel if possible
+		// pull from the channel if possible;  endChan will be empty if
+		// the task completed without error
 	default:
 		detail = agt.getTaskEndDetail()
 	}
