@@ -77,7 +77,7 @@ func init() {
 	dbutil.SetGlobalSessionProvider(dbutil.SessionFactoryFromConfig(testConfig))
 }
 
-func (_ *NoopSignalHandler) HandleSignals(_ *Agent, _ chan FinalTaskFunc) {
+func (*NoopSignalHandler) HandleSignals(_ *Agent) {
 	return
 }
 
